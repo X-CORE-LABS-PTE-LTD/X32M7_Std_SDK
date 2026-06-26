@@ -354,7 +354,6 @@ Status_card SD_PollingCardStatusBusy(sd_card_t* card,uint32_t timeoutMs)
             }
         }
         
-        SDMMC_Delay(1);
         timeout_cnt++;
     }
     
