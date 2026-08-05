@@ -354,6 +354,7 @@ Status_card SD_PollingCardStatusBusy(sd_card_t* card,uint32_t timeoutMs)
             }
         }
         
+        // SDMMC_Delay(1);
         timeout_cnt++;
     }
     
@@ -591,7 +592,27 @@ static void SD_configSDMABufferSize(sd_card_t *card, uint32_t *buffer, uint32_t 
  */
 void SD_IRQHandler(sd_card_t *card)
 {
-    uint32_t intsts = card->SDHOSTx->INTSTS;
+    const uint32_t transferInterrupts = SDHOST_CommandFlag | SDHOST_DataDMAFlag
+        | SDHOST_DmaCompleteFlag | SDHOST_ErrorFlag;
+    uint32_t intsts = card->SDHOSTx->INTSTS & transferInterrupts;
+
+    /* An error can be reported together with a completion flag. Error wins. */
+    if (intsts & SDHOST_ErrorFlag)
+    {
+        card->transferErrorFlags |= intsts & SDHOST_ErrorFlag;
+        SDMMC_ConfigInt(card->SDHOSTx, transferInterrupts, DISABLE);
+        SDMMC_ClrFlag(card->SDHOSTx, intsts);
+        card->transferState = 3;
+        return;
+    }
+
+    /* Capture the R1 response before accepting the data completion interrupt. */
+    if (intsts & SDHOST_CommandCompleteFlag)
+    {
+        card->command.response[0U] = card->SDHOSTx->CMDRSP0;
+        card->transferCommandDone = 1;
+        SDMMC_ClrFlag(card->SDHOSTx, SDHOST_CommandCompleteFlag);
+    }
 
     /* Handle SDMA boundary crossing: reload current buffer address */
     if (intsts & SDHOST_DmaCompleteFlag)
@@ -605,18 +626,38 @@ void SD_IRQHandler(sd_card_t *card)
     if (intsts & SDHOST_DataCompleteFlag)
     {
         SDMMC_ClrFlag(card->SDHOSTx, SDHOST_DataCompleteFlag);
-        SDMMC_ConfigInt(card->SDHOSTx, SDHOST_DataDMAFlag | SDHOST_DmaCompleteFlag, DISABLE);
-        card->transferState = 2;
+        SDMMC_ConfigInt(card->SDHOSTx, transferInterrupts, DISABLE);
+        if (card->transferCommandDone != 0U)
+        {
+            card->transferState = 2;
+        }
+        else
+        {
+            card->transferErrorFlags |= SDHOST_CommandTimeoutFlag;
+            card->transferState = 3;
+        }
+    }
+}
+
+/**
+ * Return the instantaneous host/card readiness without issuing CMD13 and
+ * without waiting. This function is safe to call from a periodic task.
+ */
+uint32_t SD_CardReadyFast(const sd_card_t *card)
+{
+    const uint32_t inhibitFlags = SDHOST_CommandInhibitFlag | SDHOST_DataInhibitFlag;
+
+    if ((card == NULL) || (card->SDHOSTx == NULL) || (card->transferState == 1U))
+    {
+        return 0U;
     }
 
-    /* Handle error events */
-    if (intsts & (SDHOST_DataErrorFlag | SDHOST_DmaErrorFlag))
+    if ((card->SDHOSTx->PRESTS & inhibitFlags) != 0U)
     {
-        SDMMC_ClrFlag(card->SDHOSTx, intsts & (SDHOST_DataErrorFlag | SDHOST_DmaErrorFlag));
-        SDMMC_ConfigInt(card->SDHOSTx, SDHOST_DataDMAFlag | SDHOST_DmaCompleteFlag, DISABLE);
-        card->transferState = 3;
-        card->transferErrorFlags = intsts;
+        return 0U;
     }
+
+    return (SDMMC_GetPresentFlagStatus(card->SDHOSTx, SDHOST_Data0LineLevelFlag) == SET) ? 1U : 0U;
 }
 
 
@@ -808,13 +849,18 @@ Status_card SD_WriteBlocks(sd_card_t *card, uint32_t *buffer, uint32_t startBloc
  */
 Status_card SD_ReadBlocks_IT(sd_card_t *card, uint32_t *buffer, uint32_t startBlock, uint32_t blockCount)
 {
-    Status_card status_temp;
+    const uint32_t transferInterrupts = SDHOST_CommandFlag | SDHOST_DataDMAFlag
+        | SDHOST_DmaCompleteFlag | SDHOST_ErrorFlag;
 
-    /* polling card status idle */
-    status_temp = SD_PollingCardStatusBusy(card, SD_CARD_ACCESS_WAIT_IDLE_TIMEOUT);
-    if (Status_CardStatusIdle != status_temp)
+    if ((buffer == NULL) || (blockCount == 0U))
     {
-        return Status_PollingCardIdleFailed;
+        return Status_Fail;
+    }
+
+    /* Runtime callers must never wait here; they will retry on a later poll. */
+    if (SD_CardReadyFast(card) == 0U)
+    {
+        return Status_CardStatusBusy;
     }
 
     /* Configure SDMA buffer size */
@@ -846,20 +892,17 @@ Status_card SD_ReadBlocks_IT(sd_card_t *card, uint32_t *buffer, uint32_t startBl
     card->command.flags = SDHOST_DataPresentFlag;
     card->command.responseErrorFlags = 0x00;
 
-    /* Send command - TMODE write triggers command and SDMA start */
+    /* Arm state and IRQs before starting the command to avoid a completion race. */
+    SDMMC_ConfigInt(card->SDHOSTx, transferInterrupts, DISABLE);
+    SDMMC_ClrFlag(card->SDHOSTx, transferInterrupts);
+    card->transferErrorFlags = 0U;
+    card->transferCommandDone = 0U;
+    card->transferState = 1;
+    SDMMC_ConfigInt(card->SDHOSTx, transferInterrupts, ENABLE);
+
+    /* TMODE write triggers the command and SDMA; completion is IRQ driven. */
     SDMMC_SendCommand(card->SDHOSTx, &card->command, &card->TMODE_truct);
 
-    /* Wait for command response only (polling, microsecond-level) */
-    if (SDMMC_WaitCommandDone(card->SDHOSTx, &card->command, ENABLE) != SDMMC_SUCCESS)
-    {
-        return Status_Fail;
-    }
-
-    /* Enable interrupt signal - command done, SDMA is now transferring data */
-    card->transferState = 1;
-    SDMMC_ConfigInt(card->SDHOSTx, SDHOST_DataDMAFlag | SDHOST_DmaCompleteFlag, ENABLE);
-
-    /* Return immediately - data transfer in progress via SDMA + interrupt */
     return Status_Success;
 }
 
@@ -879,13 +922,18 @@ Status_card SD_ReadBlocks_IT(sd_card_t *card, uint32_t *buffer, uint32_t startBl
  */
 Status_card SD_WriteBlocks_IT(sd_card_t *card, uint32_t *buffer, uint32_t startBlock, uint32_t blockCount)
 {
-    Status_card status_temp;
+    const uint32_t transferInterrupts = SDHOST_CommandFlag | SDHOST_DataDMAFlag
+        | SDHOST_DmaCompleteFlag | SDHOST_ErrorFlag;
 
-    /* polling card status idle */
-    status_temp = SD_PollingCardStatusBusy(card, SD_CARD_ACCESS_WAIT_IDLE_TIMEOUT);
-    if (Status_CardStatusIdle != status_temp)
+    if ((buffer == NULL) || (blockCount == 0U))
     {
-        return Status_PollingCardIdleFailed;
+        return Status_Fail;
+    }
+
+    /* Runtime callers must never wait here; they will retry on a later poll. */
+    if (SD_CardReadyFast(card) == 0U)
+    {
+        return Status_CardStatusBusy;
     }
 
     /* Configure SDMA buffer size */
@@ -917,20 +965,17 @@ Status_card SD_WriteBlocks_IT(sd_card_t *card, uint32_t *buffer, uint32_t startB
     card->command.flags = SDHOST_DataPresentFlag;
     card->command.responseErrorFlags = 0x00;
 
-    /* Send command - TMODE write triggers command and SDMA start */
+    /* Arm state and IRQs before starting the command to avoid a completion race. */
+    SDMMC_ConfigInt(card->SDHOSTx, transferInterrupts, DISABLE);
+    SDMMC_ClrFlag(card->SDHOSTx, transferInterrupts);
+    card->transferErrorFlags = 0U;
+    card->transferCommandDone = 0U;
+    card->transferState = 1;
+    SDMMC_ConfigInt(card->SDHOSTx, transferInterrupts, ENABLE);
+
+    /* TMODE write triggers the command and SDMA; completion is IRQ driven. */
     SDMMC_SendCommand(card->SDHOSTx, &card->command, &card->TMODE_truct);
 
-    /* Wait for command response only (polling, microsecond-level) */
-    if (SDMMC_WaitCommandDone(card->SDHOSTx, &card->command, ENABLE) != SDMMC_SUCCESS)
-    {
-        return Status_Fail;
-    }
-
-    /* Enable interrupt signal - command done, SDMA is now transferring data */
-    card->transferState = 1;
-    SDMMC_ConfigInt(card->SDHOSTx, SDHOST_DataDMAFlag | SDHOST_DmaCompleteFlag, ENABLE);
-
-    /* Return immediately - data transfer in progress via SDMA + interrupt */
     return Status_Success;
 }
 

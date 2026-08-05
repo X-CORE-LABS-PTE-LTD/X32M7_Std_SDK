@@ -65,6 +65,7 @@ static uint8_t *USBD_CDC_GetOtherCfgDesc (uint8_t speed, uint16_t *length);
 
 extern CDC_IF_Prop_TypeDef  APP_FOPS;
 extern uint8_t USBD_DeviceDesc   [USB_SIZ_DEVICE_DESC];
+extern volatile uint16_t usbDiagInCompleteCount;
 
 #ifdef USB_INTERNAL_DMA_ENABLED
   #if defined ( __ICCARM__ )
@@ -617,6 +618,8 @@ uint8_t  USBD_CDC_EP0_RxReady (void  *pdev)
 uint8_t  USBD_CDC_DataIn (void *pdev, uint8_t epnum)
 {
     uint16_t USB_Tx_length;
+
+    usbDiagInCompleteCount++;
 
     if (USB_Tx_State == USB_CDC_BUSY)
     {

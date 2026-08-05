@@ -171,8 +171,9 @@ typedef struct
     sd_card_workmode card_workmode;
     SDHOST_TMODE_struct  TMODE_truct;
 
-    volatile uint32_t transferState;    /* 0=idle, 1=in-progress, 2=completed, 3=error - used by interrupt-driven transfers */
-    uint32_t transferErrorFlags;        /* INTSTS captured on error for IT transfer */
+    volatile uint32_t transferState;       /* 0=idle, 1=in-progress, 2=completed, 3=error */
+    volatile uint32_t transferCommandDone; /* Command response received for the active IT transfer */
+    uint32_t transferErrorFlags;           /* INTSTS captured on error for IT transfer */
 } sd_card_t;
 
 
@@ -454,6 +455,7 @@ uint32_t swap_uint32(uint32_t val);
 
 /* Interrupt-driven transfer functions */
 void SD_IRQHandler(sd_card_t *card);        /* Called from platform IRQ handler */
+uint32_t SD_CardReadyFast(const sd_card_t *card);
 Status_card SD_ReadBlocks_IT(sd_card_t *card, uint32_t *buffer, uint32_t startBlock, uint32_t blockCount);
 Status_card SD_WriteBlocks_IT(sd_card_t *card, uint32_t *buffer, uint32_t startBlock, uint32_t blockCount);
 
